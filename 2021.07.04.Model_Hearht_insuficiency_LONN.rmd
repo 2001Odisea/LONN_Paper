@@ -1,0 +1,1199 @@
+---
+title: "Test - Customized models and Boolean NN for heart failure"
+output: html_notebook
+---
+Juan G. Diaz
+July - 2020
+Last - April, 2021
+
+The goal is to standardization the use of an available data-set for heath failure to 
+
+- Continue testing the algorithms implemented for the recommendation system
+- Test the customization of models, for instance to test Boolean - networks 
+
+# Initialization
+```{r}
+library(doParallel)
+library(foreach)
+library(readr)
+library(outliers)
+library(readxl)
+library(cluster)
+require(ggplot2)
+#library(dplyr)
+library(e1071)
+library(devtools)
+require(MASS)
+library(caret)
+library(varhandle)
+if(!require(neuralnet)){
+  install.packages("neuralnet")
+  library(neuralnet)
+}
+library(DT)
+library(rio)
+library(keras)
+```
+
+
+# Data extraction and normalization
+
+The data from has been obtained from the [uci repository](https://archive.ics.uci.edu/ml/datasets/Heart+failure+clinical+records ) and has been stored in a local database. This data has been additionally synthesized and correlated to patient therapies
+
+This data contains the following instances:
+
+- 12 core parameters ranging from 
+  age 
+  anemia 
+  creatinine_phosphokinase
+  diabetes 
+  ejection_fraction
+  high_blood_pressure 
+  platelets 
+  serum_creatinine 
+  serum_sodium
+  sex (binary - 0 Woman, 1 Men)
+  smoking 
+  time (feedback period)
+  Patient therapy
+- one binary label for death event
+
+
+Download data
+
+```{r}
+library(readr)
+X2020_Hearth_Failure_Health_Record <- read_csv("D:/Projects/F&E/2020/Example_Data/2020_Hearth-Failure_Health_Record.csv")
+# Consider possible changes in year of storage folder
+X2020_SyntheticData <- read_csv("D:/Projects/F&E/2021/KI_Safety_Logic_DNN/Data/2020.SyntheticData.csv")
+```
+
+Then we make a
+-database selection (between synthetic and non-synthetic data), 
+-reformatting as number from characters
+
+before the workflow for modelling is started.
+
+Decide if synthetic data should be used
+
+  - 0 is original data
+  - 1 is synthetic data
+
+```{r}
+Synth_log <- 1
+```
+
+And represent database for analysis:
+
+- 0 means original database
+- 1 synthetic database
+
+```{r}
+if(Synth_log == 0){
+  Data_H_INP <- X2020_Hearth_Failure_Health_Record
+} 
+if(Synth_log == 1){
+  Data_H_INP <- X2020_SyntheticData
+} 
+#Data_H <- X2020_SyntheticData
+```
+And make a partition between training and test data
+
+```{r}
+set.seed(3033)
+d01 <- Data_H_INP 
+intrain <- createDataPartition(d01$TK, p= 0.8, list = FALSE)
+Data_H <- d01[intrain,]
+testing <- d01[-intrain,]
+```
+
+
+A simple data inspection helps to analyse the different distributions in the data-set
+```{r}
+hist(Data_H$age)
+hist(Data_H$serum_creatinine)
+```
+For a fast model construction it is first necessary to 
+
+- Convert characters in numerical parameters
+- Normalize the data
+
+Here are the corresponding conversions:
+
+For hearth insufficiency:
+* SHF => HF = 1; otherwise HF = 2
+
+For the therapies
+* Tk = 1 => ARB
+* Tk = 2 => ACE
+* Tk = 3 => Aspirin
+* Tk = 4 => Betablocker
+
+```{r}
+Data_H_N <- Data_H
+if(Synth_log == 1){
+  aux_HF1 <- Data_H_N$HF
+  aux_TK1 <- Data_H_N$TK 
+  aux_HF <- ifelse(aux_HF1 == "SHF" , aux_HF <- 1, aux_HF <- 2)
+  aux_TK <- ifelse(aux_TK1 == "Aspirin", aux_TK <- 1, ifelse(aux_TK1 == "ACE", aux_TK <- 2, ifelse(aux_TK1 == "Beta_blocker", aux_TK <- 3, aux_TK <- 4)))
+  Data_H_N$HF <- aux_HF
+  Data_H_N$TK <- aux_TK
+}
+```
+
+and perform normalization
+
+```{r}
+
+normalize <- function(x) {
+     return ((x - min(x)) / (max(x) - min(x)))
+}
+Data_H_N$age <- normalize(Data_H$age)
+Data_H_N$creatinine_phosphokinase <- normalize(Data_H$creatinine_phosphokinase)
+Data_H_N$ejection_fraction <- normalize(Data_H$ejection_fraction)
+Data_H_N$platelets <- normalize(Data_H$platelets)
+Data_H_N$serum_creatinine <- normalize(Data_H$serum_creatinine)
+Data_H_N$serum_sodium <- normalize(Data_H$serum_sodium)
+Data_H_N$TK <- Data_H_N$TK/max(Data_H_N$TK)  #normalize(Data_H_N$TK)
+Data_H_N$time <- normalize(Data_H_N$time)
+
+# Since time is not an input parameter, we remove this column from the test data
+#Data_H_N <- subset( Data_H_N, select = -time )
+```
+
+Finally we introduce the parameters required for the analysis, i.e. number of parameters to be analysed
+
+- In this example we have only one objective function: death events of patients
+- The time is not relevant
+- Therefore, the other 10 parameters are used as inputs
+
+# Data analysis and modelling: standard model definition
+
+Keras only accepts matrices. Thus, convert data-frames into matrices
+```{r}
+#train_data <- cbind(Data_H_N$age,Data_H_N$anaemia,Data_H_N$creatinine_phosphokinase,Data_H_N$diabetes,Data_H_N$ejection_fraction,Data_H_N$high_blood_pressure,Data_H_N$platelets, Data_H_N$serum_creatinine,Data_H_N$serum_sodium,Data_H_N$sex,Data_H_N$smoking)
+# Select between lable - death event
+if(Synth_log == 0){
+    train_data <- cbind(Data_H_N$age,Data_H_N$creatinine_phosphokinase,Data_H_N$smoking,Data_H_N$ejection_fraction,Data_H_N$high_blood_pressure,Data_H_N$platelets, Data_H_N$serum_creatinine,Data_H_N$serum_sodium,Data_H_N$sex)
+        train_labels <- cbind(Data_H_N$DEATH_EVENT)
+}
+# Or TK and Time
+if(Synth_log == 1){
+    train_data <- cbind(Data_H_N$age,Data_H_N$creatinine_phosphokinase,Data_H_N$smoking,Data_H_N$ejection_fraction,Data_H_N$high_blood_pressure,Data_H_N$platelets, Data_H_N$serum_creatinine,Data_H_N$serum_sodium,Data_H_N$sex,Data_H_N$anaemia)
+      #cbind(Data_H_N$age,Data_H_N$creatinine_phosphokinase,Data_H_N$smoking,Data_H_N$ejection_fraction,Data_H_N$high_blood_pressure,Data_H_N$platelets, Data_H_N$serum_creatinine,Data_H_N$serum_sodium,Data_H_N$sex, Data_H_N$HF)
+    
+    train_labels <- cbind(Data_H_N$HF, Data_H_N$time) #cbind(Data_H_N$TK, Data_H_N$time)
+}
+Synth_log
+```
+Define the number of parameters in the model
+
+```{r}
+t_numb_labels <-  length(train_labels[1,]) 
+numb_Labels <- t_numb_labels
+n_t_lab1 <-  length(train_data[1,])
+##which( colnames(Data_H_N)=="smoking" ) 
+```
+
+# Reference models
+Introduce the parameters required for the model
+```{r}
+num_neur_imp <- length(train_data[1,])
+num_neur_int <- 40
+```
+
+Visualize parameters
+```{r}
+datatable(cbind(n_t_lab1,numb_Labels,num_neur_imp,num_neur_int ))
+```
+Original model with layers attached to conventional activation functions
+```{r}
+library(tfruns)
+N_Layers_1 <- 100
+N_Layers_2 <- 10 
+N_Layers_3 <- 30
+N_Layers_4 <- 2
+build_model <- function() {
+  
+  # relu - rectified linear unit
+  # sigmoid
+  
+  model <- keras_model_sequential() %>%
+    
+    layer_dense(units = num_neur_imp, activation = "relu",
+                input_shape = dim(train_data)[2]) %>%
+    layer_dense(units = N_Layers_1 , activation = "relu") %>%
+    #layer_dense(units = N_Layers_2 , activation = "relu") %>%
+    layer_dense(units = N_Layers_3  , activation = "relu") %>%
+    #layer_dense(units = N_Layers_4  , activation = "relu") %>%
+    layer_dense(units = 2, activation = "sigmoid")
+  
+  model %>% compile(
+    loss = "mse",
+    # loss = 'categorical_crossentropy',
+    #optimizer = 'rmsprop',
+    optimizer = optimizer_adam(lr=0.02), #optimizer_rmsprop(),
+    metrics = list("mean_absolute_error")
+  )
+  
+  model
+}
+
+model <- build_model()
+model %>% summary()
+
+# Display training progress by printing a single dot for each completed epoch.
+print_dot_callback <- callback_lambda(
+  on_epoch_end = function(epoch, logs) {
+    if (epoch %% 80 == 0) cat("\n")
+    cat(".")
+  }
+)    
+
+epochs <- 100
+#y_binary = to_categorical(train_labels)
+# Fit the model and store training stats
+history <- model %>% fit(
+  train_data,
+  train_labels,
+  epochs = epochs,
+  validation_split = 0.2,
+  verbose = 0,
+  batchsize = 32,
+  callbacks = list(print_dot_callback)
+)
+```
+
+
+Plot results
+```{r}
+library(ggplot2)
+
+plot(history, metrics = "mean_absolute_error", smooth = TRUE) +
+  coord_cartesian(ylim = c(0.25, 0.3)) + geom_smooth()
+```
+Deploy final training error
+```{r}
+history$metrics$val_mean_absolute_error[epochs]
+history$metrics
+```
+
+# Definition of fuzzi logical networks
+
+In this block we employ the same model definition above, but we define in the corresponding layers the perceptons and boolean rules as defined according to [this publication](https://www.sciencedirect.com/science/article/pii/S0950705120302896 ).
+
+Following these ideas, we define the following layers:
+
+- The imput layer: as a layer of perceptons
+- The first internal layer - 5 neurons: *And* layer for the conjunction of the information stored in the percepton layer
+- The second layer - 3 neurons: *And* layer for the conjunction of the informations from the first internal layer
+- The third  layer -2 neurons: *Or* layer, to discriminate all the conjunctions of the previous layer
+- Final layer - final decision - eventually modelled as a sigmoid function
+
+The selected architecture works as a discrimination of the information delivered from each one of the layers. The corresponding values for the initializers were introduced according to the instructions provided by [this tutorial](https://keras.rstudio.com/articles/guide_keras.html)
+
+This example is for the definition of concatenated and frozen layers with a customized topology:
+
+- Control the parameters in different layers
+- Define pair-wise inputs and modify the topology of the NN
+- Introduce "learning rate" as the frequency with which the parameters are adjusted in each parameter- [optimization step](http://bar.rady.ucsd.edu/dl_reg.html)  
+
+```{r}
+library(keras)
+library(reticulate)
+library(tensorflow)
+# With Kerastune is possible to optimize the number of neurons in eah layer
+# library(kerastuneR)
+Beta_M <- 1.5 #1.5
+Alpha_M <- 0.5
+Lamda_M <- 1.0
+
+Beta_M_P <- 1.0 #0.005 #1.5
+Alpha_M_P <- 0.5
+Lamda_M_P <- 1.0
+
+N_Layers_2 <- 1
+Inp_schapes_lay_2 <- 2
+N_Layers_3 <- 2
+
+# Custom activation function - Input layers
+build_model <- function(hp) {
+ dummy_custom_activation_P <- function(x) {
+  (1/Beta_M_P)*log((1 + exp(Beta_M_P*x))/(1 + exp(Beta_M_P*(x - 1 ))),base=exp(1))
+}
+# Custom activation - for internal layers 
+ dummy_custom_activation <- function(x) {
+  (1/Beta_M)*log((1 + exp(Beta_M*x))/(1 + exp(Beta_M*(x - 1 ))),base=exp(1))
+ }
+ 
+ # *First layer* as input with custom activation
+ layer_1 <- keras_model_sequential() %>% layer_dense(units = num_neur_imp, activation  = "elu",input_shape = dim(train_data)[2])
+ #  dummy_custom_activation_P 
+ 
+ # *Second Layer* with concatenated neurons - as *AND*
+layer_2 <- local({
+  main_input <- layer_input(shape = dim(train_data)[2], name = 'main_input')
+  
+layer_2_1 <- main_input %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 ,trainable = "FALSE")  
+ 
+  layer_2_2 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_3 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_4 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+#  main_output <- layer_concatenate(c(layer_2_1,layer_2_2,layer_2_3, layer_2_4))
+ # Concatenate first "And" layers to perform pair-wise grouping
+  layer_I_1 <- layer_concatenate(c(layer_2_1 , layer_2_2))
+  layer_I_2 <- layer_concatenate(c(layer_2_2 , layer_2_3))
+   layer_I_3 <- layer_concatenate(c(layer_2_3 , layer_2_4))
+   
+# Second "And" layers  
+   layer_2_II_1 <- layer_I_1 %>% layer_dense(units = 1, activation = dummy_custom_activation,  use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")
+ 
+  layer_2_II_2 <- layer_I_2 %>% layer_dense(units = 1, activation = dummy_custom_activation,  use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")  
+  
+  layer_2_II_3 <- layer_I_3 %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")
+# output *And* layer 
+# main_output <-   layer_concatenate(c(layer_2_II_1,layer_2_II_3))  
+#main_output <- layer_concatenate(c(layer_2_II_1,layer_2_II_2,layer_2_II_3))
+  And_I <- layer_concatenate(c(layer_2_II_1,layer_2_II_2))
+  And_II <- layer_concatenate(c(layer_2_II_2,layer_2_II_3))
+  
+  # *OR* Layers
+  
+  OR_I <- And_I %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0))
+  OR_II <- And_II %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0))
+  main_output <-   layer_concatenate(c(OR_I,OR_II)) 
+ 
+  keras_model(
+      inputs = main_input,
+      outputs = main_output
+  )
+ 
+})
+freeze_weights(layer_2)
+
+# Third layer - as *OR*
+layer_3 <- keras_model_sequential()   %>% layer_dense(units = 2, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0)) 
+ freeze_weights(layer_3)
+  
+#layer_4 <- keras_model_sequential()   %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0)) 
+#  freeze_weights(layer_4)
+
+
+# Final sequential layer model
+model <- keras_model_sequential() %>% layer_1 %>% layer_2 %>% layer_dense(units = 2)  #activation = "sigmoid"
+
+model %>% compile(
+    loss = "mse",
+    #loss = 'categorical_crossentropy',
+    # optimizer = 'rmsprop',
+    # http://bar.rady.ucsd.edu/dl_reg.html
+    optimizer = optimizer_adam(lr=0.02), #optimizer_rmsprop(),
+    metrics = list("mean_absolute_error")
+  )
+}
+
+model_bn <- build_model()
+model_bn %>% summary()
+```
+
+
+
+
+Show the initial weigths of the model
+```{r}
+get_weights(model_bn)
+```
+And perform training
+```{r}
+# Display training progress by printing a single dot for each completed epoch.
+print_dot_callback <- callback_lambda(
+  on_epoch_end = function(epoch, logs) {
+    if (epoch %% 80 == 0) cat("\n")
+    cat(".")
+  }
+)    
+
+epochs <- 100
+#y_binary = to_categorical(train_labels)
+# Fit the model and store training stats
+history_bn <- model_bn %>% fit(
+  train_data,
+  train_labels,
+  epochs = epochs,
+  validation_split = 0.2,
+  verbose = 0,
+  batchsize = 50,
+  callbacks = list(print_dot_callback)
+)
+```
+```{r}
+get_weights(model_bn)
+```
+Deploy model history
+```{r}
+history$metrics
+```
+
+
+Plot results
+```{r}
+library(ggplot2)
+
+plot(history_bn, metrics = "mean_absolute_error", smooth = TRUE) +
+  coord_cartesian(ylim = c(0.3, 0.4)) + geom_smooth()
+```
+
+Final value of the mean absolute error
+```{r}
+history_bn$metrics$val_mean_absolute_error[epochs]
+```
+Finally make an estimation of the hierarchy of the solutions, using [heatmaps](https://www.datanovia.com/en/lessons/heatmap-in-r-static-and-interactive-visualization/)
+
+* Fisrt: estimation of the weight distribution in the input layer. This provides information about the hierarchy of parameters in the input layers
+* Second: estimation of the weight distribution in the fix-internal layers for the fuzzi-logics. This provides information about different parameter grouping from the input layer.
+
+For the anotation of the heat maps we use the this [note book](https://jokergoo.github.io/ComplexHeatmap-reference/book/heatmap-annotations.html).
+
+```{r}
+hiearchy_inp <- c()
+for(i in 1:9){hiearchy_inp[i] <- mean(get_weights(model_bn)[[1]][,i])}
+labels_hierarch <- c("age","creatinine_phosphokinase","smoking","ejection_fraction","high_blood_pressure","platelets", "serum_creatinine","serum_sodium","sex","anemia") #"HF"
+Hierarchy_parameters <- (cbind(labels_hierarch,abs(hiearchy_inp)))
+Hierarchy_parameters <- Hierarchy_parameters[order(Hierarchy_parameters[,2],decreasing=FALSE),]
+Matrix_Hierarchy <- (as.matrix(get_weights(model_bn)[[1]]))
+rownames(Matrix_Hierarchy) <- c("age","creatinine_phosphokinase","smoking","ejection_fraction","high_blood_pressure","platelets", "serum_creatinine","serum_sodium","sex","anemia") 
+colnames(Matrix_Hierarchy) <- c("H1","H2","H3","H4","H5","H6","H7","H8","H9","H10")
+Matrix_Hierarchy
+library("pheatmap")
+df_Layer1 <- as.data.frame(Matrix_Hierarchy)
+df_Layer1_t <- as.data.frame(t(Matrix_Hierarchy))
+Variable_i <- kmeans(df_Layer1, centers = 6) #nstart = 25
+H_i <- kmeans(df_Layer1_t, centers = 6)
+km_L_Cl <- as.data.frame(Variable_i$cluster)
+km_H_Cl <- as.data.frame(H_i$cluster)
+df_Matr_Hier <- as.data.frame(abs(Matrix_Hierarchy))
+pheatmap(df_Matr_Hier,annotation_row = km_L_Cl,annotation_col = km_H_Cl, annotation_names_row = FALSE, annotation_names_c = FALSE, annotation_legend = TRUE)
+```
+
+For the next layer we perform again a similar analysis
+
+```{r}
+Matrix_Hierarchy <- (as.matrix(cbind(get_weights(model_bn)[[3]][,1],get_weights(model_bn)[[5]][,1],get_weights(model_bn)[[7]][,1],get_weights(model_bn)[[9]][,1])))
+#rownames(Matrix_Hierarchy) <- c("age","creatinine_phosphokinase","smoking","ejection_fraction","high_blood_pressure","platelets", "serum_creatinine","serum_sodium","sex","HF") 
+rownames(Matrix_Hierarchy) <- c("H1","H2","H3","H4","H5","H6","H7","H8","H9","H10")
+colnames(Matrix_Hierarchy) <- c("M1","M2","M3","M4")
+Matrix_Hierarchy
+df_Layer1 <- as.data.frame(Matrix_Hierarchy)
+df_Layer1_t <- as.data.frame(t(Matrix_Hierarchy))
+H_i <- kmeans(df_Layer1, centers = 6) #nstart = 25
+O_i <- kmeans(df_Layer1_t, centers = 3)
+km_L_Cl <- as.data.frame(H_i$cluster)
+km_H_Cl <- as.data.frame(O_i$cluster)
+df_Matr_Hier <- as.data.frame(abs(Matrix_Hierarchy))
+library("pheatmap")
+pheatmap(df_Matr_Hier,annotation_row = km_L_Cl,annotation_col = km_H_Cl,annotation_names_row = FALSE, annotation_names_c = FALSE)
+```
+
+For more complex model configurations, i.e. more complex topologies and input configurations, see this [reference](https://andrie.github.io/deepviz/index.html)
+
+# Further test: Fuzzy logic with more neurons
+We put 10 instead 4-neurons with fuzzi logic in one of the intermediary layers
+```{r}
+library(keras)
+library(reticulate)
+library(tensorflow)
+# With Kerastune is possible to optimize the number of neurons in eah layer
+# library(kerastuneR)
+Beta_M <- 1.5 #1.5
+Alpha_M <- 0.5
+Lamda_M <- 1
+
+Beta_M_P <- 1.0 #0.005 #1.5
+Alpha_M_P <- 0.5
+Lamda_M_P <- 1
+
+N_Layers_2 <- 1
+Inp_schapes_lay_2 <- 2
+N_Layers_3 <- 2
+
+# Custom activation function - Input layers
+build_model <- function(hp) {
+ dummy_custom_activation_P <- function(x) {
+  (1/Beta_M_P)*log((1 + exp(Beta_M_P*x))/(1 + exp(Beta_M_P*(x - 1 ))),base=exp(1))
+}
+# Custom activation - for internal layers 
+ dummy_custom_activation <- function(x) {
+  (1/Beta_M)*log((1 + exp(Beta_M*x))/(1 + exp(Beta_M*(x - 1 ))),base=exp(1))
+ }
+ 
+ # *First layer* as input with custom activation
+ layer_1 <- keras_model_sequential() %>% layer_dense(units = num_neur_imp, activation  =  "elu" ,input_shape = dim(train_data)[2])
+#dummy_custom_activation_P 
+ 
+ # *Second Layer* with concatenated neurons - as *AND*
+layer_2 <- local({
+  main_input <- layer_input(shape = dim(train_data)[2], name = 'main_input')
+  
+layer_2_1 <- main_input %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 ,trainable = "FALSE")  
+ 
+  layer_2_2 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_3 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_4 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_5 <- main_input %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 ,trainable = "FALSE")  
+ 
+  layer_2_6 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_7 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_8 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_9 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_10 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+#  main_output <- layer_concatenate(c(layer_2_1,layer_2_2,layer_2_3, layer_2_4))
+ # Concatenate first "And" layers to perform pair-wise grouping
+  layer_I_1 <- layer_concatenate(c(layer_2_1 , layer_2_2))
+  layer_I_2 <- layer_concatenate(c(layer_2_3 , layer_2_4))
+  layer_I_3 <- layer_concatenate(c(layer_2_5 , layer_2_6))
+  layer_I_4 <- layer_concatenate(c(layer_2_7 , layer_2_8))
+  layer_I_5 <- layer_concatenate(c(layer_2_9 , layer_2_10))
+   
+# Second "And" layers  
+   layer_2_II_1 <- layer_I_1 %>% layer_dense(units = 1, activation = dummy_custom_activation,  use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")
+ 
+  layer_2_II_2 <- layer_I_2 %>% layer_dense(units = 1, activation = dummy_custom_activation,  use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")  
+  
+  layer_2_II_3 <- layer_I_3 %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")
+  
+  layer_2_II_4 <- layer_I_4 %>% layer_dense(units = 1, activation = dummy_custom_activation,  use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")  
+  
+  layer_2_II_5 <- layer_I_5 %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")
+# output *And* layer 
+# main_output <-   layer_concatenate(c(layer_2_II_1,layer_2_II_3))  
+#main_output <- layer_concatenate(c(layer_2_II_1,layer_2_II_2,layer_2_II_3))
+  And_I <- layer_concatenate(c(layer_2_II_1,layer_2_II_2,layer_2_II_3))
+  And_II <- layer_concatenate(c(layer_2_II_3,layer_2_II_4,layer_2_II_5))
+
+  
+  # *OR* Layers
+  
+  OR_I <- And_I %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0))
+  OR_II <- And_II %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0))
+  main_output <-   layer_concatenate(c(OR_I,OR_II)) 
+ 
+  keras_model(
+      inputs = main_input,
+      outputs = main_output
+  )
+ 
+})
+freeze_weights(layer_2)
+
+# Third layer - as *OR*
+layer_3 <- keras_model_sequential()   %>% layer_dense(units = 2, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0)) 
+ freeze_weights(layer_3)
+  
+#layer_4 <- keras_model_sequential()   %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0)) 
+#  freeze_weights(layer_4)
+
+
+# Final sequential layer model
+model <- keras_model_sequential() %>% layer_1 %>% layer_2 %>% layer_dense(units = 2, activation = "sigmoid")  
+
+model %>% compile(
+    loss = "mse",
+    #loss = 'categorical_crossentropy',
+    optimizer = optimizer_adam(lr=0.02),#'rmsprop', #lr=0.02
+    #optimizer = optimizer_rmsprop(),
+    metrics = list("mean_absolute_error")
+  )
+}
+
+model_bn_10 <- build_model()
+model_bn_10 %>% summary()
+print_dot_callback <- callback_lambda(
+  on_epoch_end = function(epoch, logs) {
+    if (epoch %% 80 == 0) cat("\n")
+    cat(".")
+  }
+)    
+
+epochs <- 100
+#y_binary = to_categorical(train_labels)
+# Fit the model and store training stats
+history_bn_10 <- model_bn_10 %>% fit(
+  train_data,
+  train_labels,
+  epochs = epochs,
+  validation_split = 0.2,
+  verbose = 0,
+  batchsize = 30,
+  callbacks = list(print_dot_callback)
+)
+```
+Plot results
+```{r}
+library(ggplot2)
+
+plot(history_bn_10, metrics = "mean_absolute_error", smooth = TRUE) +
+  coord_cartesian(ylim = c(0.25, 0.32)) + geom_smooth()
+```
+Final value of the mean absolute error
+```{r}
+history_bn_10$metrics$val_mean_absolute_error[epochs]
+```
+
+# Iteration over different values - 
+
+Vector with different Beta parameters for the internal layer
+```{r}
+Beta_it_Int <- c(-2, -1.75,-1.5, -1, -0.75, -0.5, -0.01, 0.01, 0.75,0.5, 1, 1.5, 1.75, 2)
+Beta_it_Int_P <- c(0.01,0.5, 1, 1.5, 2)
+Summary <- c()
+N_Layers_1 <- 8
+N_Layers_2 <- N_Layers_1 + 2
+N_Layers_3 <- 4
+Summary_Final <- list()
+pb <- txtProgressBar(min = 1, max = length(Beta_it_Int), style = 3)
+#length(Beta_it_Int_P)
+for(j in 1:2){
+for(i in 1:length(Beta_it_Int)){
+  Beta_M <- Beta_it_Int[i]
+  Beta_M_P <- 0.01#Beta_it_Int_P[j]
+Alpha_M <- 0.5
+Lamda_M <- 1
+Beta_M_P <- 2 #0.005 #1.5
+Alpha_M_P <- 0.5
+Lamda_M_P <- 1
+
+# Custom activation function - Input layers
+build_model <- function(hp) {
+ dummy_custom_activation_P <- function(x) {
+  (1/Beta_M_P)*log((1 + exp(Beta_M_P*x))/(1 + exp(Beta_M_P*(x - 1 ))),base=exp(1))
+}
+# Custom activation - for internal layers 
+ dummy_custom_activation <- function(x) {
+  (1/Beta_M)*log((1 + exp(Beta_M*x))/(1 + exp(Beta_M*(x - 1 ))),base=exp(1))
+ }
+ 
+ # *First layer* as input with custom activation
+ layer_1 <- keras_model_sequential() %>% layer_dense(units = num_neur_imp, activation  =  "elu" ,input_shape = dim(train_data)[2])
+ #dummy_custom_activation_P
+ 
+ # *Second Layer* with concatenated neurons - as *AND*
+layer_2 <- local({
+  main_input <- layer_input(shape = dim(train_data)[2], name = 'main_input')
+  
+layer_2_1 <- main_input %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 ,trainable = "FALSE")  
+ 
+  layer_2_2 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_3 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_4 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+#  main_output <- layer_concatenate(c(layer_2_1,layer_2_2,layer_2_3, layer_2_4))
+ # Concatenate first "And" layers to perform pair-wise grouping
+  layer_I_1 <- layer_concatenate(c(layer_2_1 , layer_2_2))
+  layer_I_2 <- layer_concatenate(c(layer_2_2 , layer_2_3))
+   layer_I_3 <- layer_concatenate(c(layer_2_3 , layer_2_4))
+   
+# Second "And" layers  
+   layer_2_II_1 <- layer_I_1 %>% layer_dense(units = 1, activation = dummy_custom_activation,  use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")
+ 
+  layer_2_II_2 <- layer_I_2 %>% layer_dense(units = 1, activation = dummy_custom_activation,  use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")  
+  
+  layer_2_II_3 <- layer_I_3 %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")
+# output *And* layer 
+# main_output <-   layer_concatenate(c(layer_2_II_1,layer_2_II_3))  
+#main_output <- layer_concatenate(c(layer_2_II_1,layer_2_II_2,layer_2_II_3))
+  And_I <- layer_concatenate(c(layer_2_II_1,layer_2_II_2))
+  And_II <- layer_concatenate(c(layer_2_II_2,layer_2_II_3))
+  
+  # *OR* Layers
+  
+  OR_I <- And_I %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0))
+  OR_II <- And_II %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0))
+  main_output <-   layer_concatenate(c(OR_I,OR_II)) 
+ 
+  keras_model(
+      inputs = main_input,
+      outputs = main_output
+  )
+ 
+})
+freeze_weights(layer_2)
+
+# Third layer - as *OR*
+#layer_3 <- keras_model_sequential()   %>% layer_dense(units = N_Layers_3, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0)) 
+ # freeze_weights(layer_3)
+  
+#layer_4 <- keras_model_sequential()   %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0)) 
+#  freeze_weights(layer_4)
+
+
+# Final sequential layer model
+model <- keras_model_sequential() %>% layer_1 %>% layer_2 %>% layer_dense(units = 2,activation = "sigmoid") #, activation = dummy_custom_activation  
+
+model %>% compile(
+    loss = "mse",
+    #loss = 'categorical_crossentropy',
+    optimizer = optimizer_adam(lr=0.02),#'rmsprop',
+    #optimizer = optimizer_rmsprop(),
+    metrics = list("mean_absolute_error")
+  )
+}
+
+model <- build_model()
+
+
+
+epochs <- 20
+#y_binary = to_categorical(train_labels)
+# Fit the model and store training stats
+history <- model %>% fit(
+  train_data,
+  train_labels,
+  epochs = epochs,
+  validation_split = 0.2,
+  verbose = 0,
+  batchsize = 50,
+)
+Summary[i] <- history$metrics$val_mean_absolute_error[epochs]
+setTxtProgressBar(pb,i)
+}
+  close(pb)
+  Summary_Final[[j]] <- Summary
+}
+```
+Plot final results
+```{r}
+plot(Summary_Final[[2]], type="o", col="blue", lty=2, xlab = "Beta Int. Layers", ylab = "Error", ylim = c(0.27, 0.3))
+#points(Summary[[2]], type="o",col="red", pch="B", lty=2)
+#points(Summary[[3]], type="o",col="dark red", pch="C", lty=2)
+#points(Summary[[4]], type="o",col="black", pch="D", lty=2)
+#points(Summary[[5]], type="o",col="black", pch="E", lty=2)
+```
+
+```{r}
+library(ggplot2)
+Beta_0.01 <- Summary_Final[[1]]
+Beta_0.5 <- Summary_Final[[2]]
+#Beta_1 <- Summary_Final[[3]]
+#Beta_1.5 <- Summary_Final[[4]]
+#Beta_2 <- Summary_Final[[5]]
+Tot_mean_Err <- c()
+aux_it <- length(Beta_0.5) 
+for(i in 1:aux_it){
+  Tot_mean_Err[i] <- mean(Beta_0.5[i])
+}
+aux1 <- as.data.frame((cbind(Beta_it_Int,Beta_0.5)))
+ggplot(aux1, mapping = aes(x = Beta_it_Int, y = Beta_0.5)) + geom_line(aes(fill="0.1"), size = 1, colour = "red") +
+    #geom_point(aes(x = Beta_it_Int, y = Beta_0.5), size = 3, colour = "red")+ 
+  
+  #geom_line(aes(x=Beta_it_Int,y = Beta_0.5), linetype = "dashed", colour = "orange") + geom_point(aes(x=Beta_it_Int,y = Beta_0.5, shape = "Beta_0.5"),size = 3, colour = "orange") + 
+  
+  #geom_line(aes(x=Beta_it_Int,y = Beta_1), linetype = "dashed", colour = "blue") + geom_point(aes(x=Beta_it_Int,y = Beta_1,shape="Beta_1"), size = 3, colour = "blue") +
+  
+    #geom_line(aes(x=Beta_it_Int,y = Beta_1.5), linetype = "dashed",colour = "cyan") + geom_point(aes(x=Beta_it_Int,y = Beta_1.5,shape="Beta_1.5"), size = 3, colour = "cyan") +
+  
+  #geom_line(aes(x=Beta_it_Int,y = Beta_2), linetype = "dashed", colour = "black") + geom_point(aes(x=Beta_it_Int,y = Beta_2,shape="Beta_2"), size = 3, colour = "black") +
+  
+  geom_smooth(aes(x=Beta_it_Int,y = Tot_mean_Err))+
+  
+  labs(x = "Beta (internal layers)", y = "Mean Error")  
+```
+# Strategy for a recommend system: training using a group of patients with "good performance": low mortality and long treatment period
+
+The goal is to develop a recommend system using different reference groups for recommendation of best treatments:
+
+* One model is trained over the whole data-set and delivers a raw prediction of therapy and treatment time depending on the whole collected data
+
+* A second model is trained only over the best outcomes: long treatment times (i.e. patients with a best chance to survive the treatment), and that didn't deceased
+
+
+If there is a matching between both predictions, then the recommendation using the first model is feasible. Otherwise, the mis-matching should provide a warning to the therapist, and should point out into the possibility of consider a customized analysis of the patient for the recommendation of an adequate therapy.
+
+First generate a group with good performant data
+
+* The treatment time is in this context normalized
+* We introduce as a criteria a threshold time, thr_time > 0.45
+```{r}
+thr_time <- 0.4
+```
+
+and filter the data
+
+```{r}
+library(dplyr)
+if(Synth_log == 1){
+  Data_H_N_d1 <- Data_H_N %>% filter( DEATH_EVENT == 1) %>% filter(time > thr_time)
+    train_data_d1 <- cbind(Data_H_N_d1$age,Data_H_N_d1$creatinine_phosphokinase,Data_H_N_d1$diabetes,Data_H_N_d1$ejection_fraction,Data_H_N_d1$high_blood_pressure,Data_H_N_d1$platelets, Data_H_N_d1$serum_creatinine,Data_H_N_d1$serum_sodium,Data_H_N_d1$sex, Data_H_N_d1$HF)
+    train_labels_d1 <- cbind(Data_H_N_d1$TK, Data_H_N_d1$time)
+}
+```
+
+And retrain a boolean-model with this "optimal group". Observe that we train the last defined model
+
+```{r}
+library(keras)
+library(reticulate)
+library(tensorflow)
+# With Kerastune is possible to optimize the number of neurons in eah layer
+# library(kerastuneR)
+Beta_M <- 1.5 #1.5
+Alpha_M <- 0.5
+Lamda_M <- 1
+
+Beta_M_P <- 1.0 #0.005 #1.5
+Alpha_M_P <- 0.5
+Lamda_M_P <- 1
+
+N_Layers_2 <- 1
+Inp_schapes_lay_2 <- 2
+N_Layers_3 <- 2
+
+# Custom activation function - Input layers
+build_model <- function(hp) {
+ dummy_custom_activation_P <- function(x) {
+  (1/Beta_M_P)*log((1 + exp(Beta_M_P*x))/(1 + exp(Beta_M_P*(x - 1 ))),base=exp(1))
+}
+# Custom activation - for internal layers 
+ dummy_custom_activation <- function(x) {
+  (1/Beta_M)*log((1 + exp(Beta_M*x))/(1 + exp(Beta_M*(x - 1 ))),base=exp(1))
+ }
+ 
+ # *First layer* as input with custom activation
+ layer_1 <- keras_model_sequential() %>% layer_dense(units = num_neur_imp, activation  =  "elu" ,input_shape = dim(train_data)[2])
+#dummy_custom_activation_P 
+ 
+ # *Second Layer* with concatenated neurons - as *AND*
+layer_2 <- local({
+  main_input <- layer_input(shape = dim(train_data)[2], name = 'main_input')
+  
+layer_2_1 <- main_input %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 ,trainable = "FALSE")  
+ 
+  layer_2_2 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_3 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_4 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_5 <- main_input %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 ,trainable = "FALSE")  
+ 
+  layer_2_6 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_7 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_8 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_9 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation,  input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+  layer_2_10 <- main_input  %>% layer_dense(units = N_Layers_2, activation = dummy_custom_activation, input_shape = Inp_schapes_lay_2 , trainable = "FALSE")
+  
+#  main_output <- layer_concatenate(c(layer_2_1,layer_2_2,layer_2_3, layer_2_4))
+ # Concatenate first "And" layers to perform pair-wise grouping
+  layer_I_1 <- layer_concatenate(c(layer_2_1 , layer_2_2))
+  layer_I_2 <- layer_concatenate(c(layer_2_3 , layer_2_4))
+  layer_I_3 <- layer_concatenate(c(layer_2_5 , layer_2_6))
+  layer_I_4 <- layer_concatenate(c(layer_2_7 , layer_2_8))
+  layer_I_5 <- layer_concatenate(c(layer_2_9 , layer_2_10))
+   
+# Second "And" layers  
+   layer_2_II_1 <- layer_I_1 %>% layer_dense(units = 1, activation = dummy_custom_activation,  use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")
+ 
+  layer_2_II_2 <- layer_I_2 %>% layer_dense(units = 1, activation = dummy_custom_activation,  use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")  
+  
+  layer_2_II_3 <- layer_I_3 %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")
+  
+  layer_2_II_4 <- layer_I_4 %>% layer_dense(units = 1, activation = dummy_custom_activation,  use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")  
+  
+  layer_2_II_5 <- layer_I_5 %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(-1.0), trainable = "FALSE")
+# output *And* layer 
+# main_output <-   layer_concatenate(c(layer_2_II_1,layer_2_II_3))  
+#main_output <- layer_concatenate(c(layer_2_II_1,layer_2_II_2,layer_2_II_3))
+  And_I <- layer_concatenate(c(layer_2_II_1,layer_2_II_2,layer_2_II_3))
+  And_II <- layer_concatenate(c(layer_2_II_3,layer_2_II_4,layer_2_II_5))
+
+  
+  # *OR* Layers
+  
+  OR_I <- And_I %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0))
+  OR_II <- And_II %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0))
+  main_output <-   layer_concatenate(c(OR_I,OR_II)) 
+ 
+  keras_model(
+      inputs = main_input,
+      outputs = main_output
+  )
+ 
+})
+freeze_weights(layer_2)
+
+# Third layer - as *OR*
+layer_3 <- keras_model_sequential()   %>% layer_dense(units = 2, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0)) 
+ freeze_weights(layer_3)
+  
+#layer_4 <- keras_model_sequential()   %>% layer_dense(units = 1, activation = dummy_custom_activation, use_bias = "TRUE", kernel_initializer = initializer_constant(1.0), bias_initializer= initializer_constant(0.0)) 
+#  freeze_weights(layer_4)
+
+
+# Final sequential layer model
+model <- keras_model_sequential() %>% layer_1 %>% layer_2 %>% layer_dense(units = 2, activation = "sigmoid")  
+
+model %>% compile(
+    loss = "mse",
+    #loss = 'categorical_crossentropy',
+    optimizer = optimizer_adam(lr=0.02),#'rmsprop', #lr=0.02
+    #optimizer = optimizer_rmsprop(),
+    metrics = list("mean_absolute_error")
+  )
+}
+
+model_bn_10 <- build_model()
+model_bn_10 %>% summary()
+print_dot_callback <- callback_lambda(
+  on_epoch_end = function(epoch, logs) {
+    if (epoch %% 80 == 0) cat("\n")
+    cat(".")
+  }
+)    
+
+epochs <- 100
+#y_binary = to_categorical(train_labels)
+# Fit the model and store training stats
+history_bn_10 <- model_bn_10 %>% fit(
+  train_data,
+  train_labels,
+  epochs = epochs,
+  validation_split = 0.2,
+  verbose = 0,
+  batchsize = 30,
+  callbacks = list(print_dot_callback)
+)
+```
+
+And visualize quality of training
+```{r}
+library(ggplot2)
+
+plot(history_d1, metrics = "mean_absolute_error", smooth = TRUE) +
+  coord_cartesian(ylim = c(0.15, 0.3)) + geom_smooth()
+```
+
+# Model consumption of the two trained models (good performance vs. "native" performance)
+
+Perform tests with both trained models -bad performance vs. good performance- using normalized test data
+
+Introduce again the normalization
+```{r}
+testing_N <- testing
+normalize <- function(x) {
+     return ((x - min(x)) / (max(x) - min(x)))
+}
+testing_N$age <- normalize(testing$age)
+testing_N$creatinine_phosphokinase <- normalize(testing$creatinine_phosphokinase)
+testing_N$ejection_fraction <- normalize(testing$ejection_fraction)
+testing_N$platelets <- normalize(testing$platelets)
+testing_N$serum_creatinine <- normalize(testing$serum_creatinine)
+testing_N$serum_sodium <- normalize(testing$serum_sodium)
+#testing_N$TK <- Data_H_N$TK/max(Data_H_N$TK)  #normalize(Data_H_N$TK)
+testing_N$time <- normalize(testing_N$time)
+
+ testing_N_Input <- cbind(Data_H_N$age,Data_H_N$creatinine_phosphokinase,Data_H_N$smoking,Data_H_N$ejection_fraction,Data_H_N$high_blood_pressure,Data_H_N$platelets, Data_H_N$serum_creatinine,Data_H_N$serum_sodium,Data_H_N$sex,Data_H_N$anaemia)  
+```
+
+And extract the labels. Here take into account that the therapy is assigned to each kind of heath insuficiency. Thus, insted to make a direct prediction of the therapy, we perform a binary prediction of the kind of heath failure, and according this a therapy is assigned: 
+
+* SFH Group -> ACE inhibitor (ACEi); angiotensin receptor blocker (ARB) or beta-blockers - which of these therapies is used for each patient cannot be predicted with the current model since we do not have detailed information for the therapy of each patient
+* HFNEF Group -> Aspirin
+
+```{r}
+Test_patient <- testing_N_Input
+# Labels from test dataset
+Val_Labels <- testing$HF
+aux_TK1 <- Val_Labels
+aux_TK <- ifelse(aux_TK1 == "SHF", aux_TK <- 1, aux_TK <- 2)
+Val_Labels <- aux_TK
+Val_Time <- normalize(testing$time)
+```
+Compute the matching between
+
+- model -> trained will the whole dataset
+- model_d1 -> trained only with the best outcomes (no death / longer treatment times)
+
+Estimate matching between both results
+
+- If there is matching, then use both results
+- If there is no matching, then use the results from model_d1 as recommendation, but with low confidence because there is no matching with model 
+
+
+Results for validation: in this part we must take care for the inversion of the computation and the final deploy ment of the results:
+
+
+```{r}
+N_Max <- 900
+library(MLmetrics)
+Valid_res <- model_bn %>% predict(Test_patient) 
+aux <- Valid_res[,1]
+# Label Prediction
+#1.6
+aux_V1 <- ifelse(aux < 1.8, aux_V1 <- 1, aux_V1 <- 2)
+# results for validation
+Valid_res_Val <- aux_V1[1:N_Max]
+Val_Labels <- Val_Labels[1:N_Max]
+#aux_1 <- as.integer(Val_Labels*4.5)
+#Val_Labels <- aux_1
+aux_val <- ifelse(Val_Labels == Valid_res_Val, aux_val <- 1, aux_val <- 0)
+aux_val_TP <- ifelse(Val_Labels == Valid_res_Val & Valid_res_Val == 1, aux_val_TP <- 1, aux_val_TP <- 0)
+aux_FP <- ifelse(Valid_res_Val != Val_Labels & Valid_res_Val == 1, aux_FP <- 1, aux_FP <- 0)
+aux_FN <- ifelse(Valid_res_Val != Val_Labels & Valid_res_Val == 2, aux_FN <- 1, aux_FN <- 0)
+Final_Validation <- sum(aux_val)/length(aux_val)
+Final_Precision <- sum(aux_val_TP)/(sum(aux_val_TP)+sum(aux_FP))
+Final_recall <- sum(aux_val_TP)/(sum(aux_val_TP)+sum(aux_FN))
+MSE_Time<- RMSE(Val_Time[1:N_Max],Valid_res[,2][1:N_Max])  
+Final_Validation
+Final_Precision 
+Final_recall
+MSE_Time
+data_plot <- as.data.frame(cbind(aux_V1[1:N_Max],Val_Labels[1:N_Max]))
+Delta_Time <- abs(Val_Time[1:N_Max] - Valid_res[,2][1:N_Max])
+histogram(Valid_res_Val)
+histogram(Val_Labels)
+histogram(abs(Delta_Time))
+```
+```{r}
+library(ggplot2)
+library(dplyr)
+library(hrbrthemes)
+p <- ggplot( aes(x=Delta_Time)) + 
+    geom_histogram(aes(y = ..density..)) +
+geom_density(alpha = 0.1, fill = "red")
+p
+plot(data_plot) + abline(lm(data_plot$aux_V1~data_plot$Val_Labels))
+```
+
+
+```{r}
+datatable(cbind(Val_Labels,Valid_res[,1]))
+```
+
+
+And compute predictions
+
+```{r}
+result <- model_bn %>% predict(Test_patient)
+result_d1 <- model_d1 %>% predict(Test_patient)
+# Reverse normalized predictions to obtain group number
+result[,1] <- as.integer(normalize(Valid_res[,1])*3+1)#as.integer(result[,1]*5.0)
+result_d1[,1] <- as.integer(result_d1[,1]*4)
+TK <- c()
+TK_d1 <- c()
+TK <- ifelse(result[,1] == 1, TK <-  "ARB", ifelse(result[,1] == 2, TK <- "ACE", ifelse(result[,1] == 3, TK <- "Aspirin", TK <- "Betablocker")))
+TK_d1 <- ifelse(result_d1[,1] == 1, TK_d1 <-  "ARB", ifelse(result_d1[,1] == 2, TK_d1 <- "ACE", ifelse(result_d1[,1] == 3, TK_d1 <- "Aspirin", TK_d1 <- "Betablocker")))
+result[,1] <- TK
+result_d1[,1] <- TK_d1
+
+```
+Perform a comparison between both sets
+```{r}
+datatable(cbind(result,result_d1))
+```
+
+And finally make a recommendation depending on the two reference groups
+
+* 
+
+```{r}
+Therapy <- ifelse(result[,1] == result_d1[,1], TK_f <- result[,1], TK_f <- result_d1[,1])
+Confidence <- ifelse(result[,1] == result_d1[,1], Conf <- "***", Conf <- "*")
+aux <- ifelse(Confidence == "***", aux <- result[,2], aux <- result_d1[,2])
+Survival_Prob <- ifelse(aux > 0.4, Surv <- "Prob. Survival > 1 Year", Surv <- "Prob. Survival < 1 Year")
+g <- cbind(Therapy,Confidence,Survival_Prob)
+datatable(g)
+```
+
+# Epiloge: definition of different model topologies
+With this methodology is possible to construct networks with different topologies, according to [this reference](https://andrie.github.io/deepviz/index.html):
+
+```{r}
+library(keras)
+library(reticulate)
+library(tensorflow)
+# With Kerastune is possible to optimize the number of neurons in eah layer
+# library(kerastuneR)
+Beta_M <- 2 #1.5
+Alpha_M <- 0.5
+Lamda_M <- 1
+build_model <- function(hp) {
+
+model <- local({
+  main_input <- layer_input(shape = num_neur_imp, name = 'main_input')
+ 
+ lstm_out <- main_input %>%layer_dense(units = 64, activation = 'relu')
+ 
+
+  #auxiliary_output <- lstm_out %>%
+    layer_dense(units = 1, activation = 'sigmoid', name = 'aux_output')
+
+  #auxiliary_input <- layer_input(shape = c(5), name = 'aux_input')
+
+  main_output <- layer_concatenate(c(lstm_out, main_input)) %>%
+    layer_dense(units = 64, activation = 'relu') %>%
+    layer_dense(units = 64, activation = 'relu') %>%
+    layer_dense(units = 64, activation = 'relu') %>%
+    layer_dense(units = 1, activation = 'sigmoid', name = 'main_output')
+
+  keras_model(
+        inputs = main_input,
+      outputs = main_output
+  )
+})
+
+  model %>% compile(
+    #loss = "mse",
+    loss = 'categorical_crossentropy',
+    optimizer = 'rmsprop',
+    #optimizer = optimizer_rmsprop(),
+    metrics = list("mean_absolute_error")
+  )
+}
+
+model <- build_model()
+model %>% summary()
+```
+
+The final topology is presented in the figure below
+
+```{r}
+# devtools::install_github("andrie/deepviz")
+library(deepviz)
+library(magrittr)
+model_bn %>% plot_model()
+#c(4, 10, 10, 3) %>% plot_deepviz
+```
+
+# Epilogue II: Model Drawing
+
+Currently there are no robust methods to draw the used neuronal network. The simplest way is to train a model in Neural -Net und use this model to perform a simple graphical representation of the network using this [graphical output](https://andrie.github.io/deepviz/index.html).
+
+Display the topology of the model using this [methodology](https://beckmw.wordpress.com/2013/11/14/visualizing-neural-networks-in-r-update/ )
+```{r}
+library(neuralnet)
+Data_Plot_NN <- cbind(train_data[1:5,],train_labels[1:5,]) #as.data.frame(train_data[1:5,]) #cbind(train_data[1:5,],train_labels[1:5,])
+Neural_Net_Data <- as.data.frame(Data_Plot_NN)
+mod1 <- neuralnet('V11 + V12 ~ V1 + V2 + V3 + V4 + V5 + V6 + V7 + V8 + V9 + V10', data =Neural_Net_Data, hidden = c(10,10) ) 
+```
+
+```{r}
+library(devtools)
+source_url('https://gist.githubusercontent.com/fawda123/7471137/raw/466c1474d0a505ff044412703516c34f1a4684a5/nnet_plot_update.r')
+plot.nnet(mod1, bias = FALSE, circle.col = "grey", struct = NULL, all.out = FALSE)
+```
